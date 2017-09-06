@@ -202,7 +202,7 @@ class GetUserMediaImpl {
         //   and has a new syntax/attrs to specify resolution
         //   should change `parseConstraints()` according
         //   see: https://www.w3.org/TR/mediacapture-streams/#idl-def-MediaTrackConstraints
- 
+
         final ArrayList<String> requestPermissions = new ArrayList<>();
 
         if (constraints.hasKey("audio")) {
@@ -326,7 +326,7 @@ class GetUserMediaImpl {
 
             WritableMap track_ = Arguments.createMap();
             String kind = track.kind();
- 
+
             track_.putBoolean("enabled", track.enabled());
             track_.putString("id", id);
             track_.putString("kind", kind);
@@ -403,7 +403,7 @@ class GetUserMediaImpl {
                 : DEFAULT_FPS;
 
         videoCapturer.startCapture(width, height, fps);
-  
+
         String trackId = webRTCModule.getNextTrackUUID();
         mVideoCapturers.put(trackId, videoCapturer);
 
@@ -420,6 +420,14 @@ class GetUserMediaImpl {
             }
             mVideoCapturers.remove(id);
         }
+    }
+
+    VideoCapturer getVideoCapturer(String trackId) throws Exception {
+        if (!mVideoCapturers.containsKey(tackId)) {
+          throw new Exception("Could not get video capturer for track Id " + trackId);
+        }
+
+        return mVideoCapturers.get(trackId);
     }
 
     private void requestPermissions(

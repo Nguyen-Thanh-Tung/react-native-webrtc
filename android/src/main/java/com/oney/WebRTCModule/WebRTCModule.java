@@ -29,6 +29,23 @@ import java.util.UUID;
 
 import org.webrtc.*;
 
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
+import android.graphics.Matrix;
+import android.graphics.Rect;
+import android.media.MediaScannerConnection;
+import android.net.Uri;
+import android.os.Environment;
+import android.os.HandlerThread;
+
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.lang.reflect.Field;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
+import java.util.Collections;
+
 public class WebRTCModule extends ReactContextBaseJavaModule {
     static final String TAG = WebRTCModule.class.getCanonicalName();
 
@@ -39,6 +56,14 @@ public class WebRTCModule extends ReactContextBaseJavaModule {
     final Map<String, MediaStream> mMediaStreams;
     final Map<String, MediaStreamTrack> mMediaStreamTracks;
 
+    private final MediaConstraints pcConstraints = new MediaConstraints();
+    public static final int RCT_CAMERA_CAPTURE_TARGET_MEMORY = 0;
+    public static final int RCT_CAMERA_CAPTURE_TARGET_DISK = 1;
+    public static final int RCT_CAMERA_CAPTURE_TARGET_CAMERA_ROLL = 2;
+    public static final int RCT_CAMERA_CAPTURE_TARGET_TEMP = 3;
+    private final HandlerThread imageProcessingThread;
+    private Handler imagePorcessingHandler;
+
     /**
      * The implementation of {@code getUserMedia} extracted into a separate file
      * in order to reduce complexity and to (somewhat) separate concerns.
@@ -48,9 +73,17 @@ public class WebRTCModule extends ReactContextBaseJavaModule {
     public WebRTCModule(ReactApplicationContext reactContext) {
         super(reactContext);
 
+        imageProcessingThread = new HandlerThread("PictureProcessing");
+        imageProcessingThread.start();
+        imagePorcessingHandler = new Handler(imageProcessingThread.getLooper());
+
         mPeerConnectionObservers = new SparseArray<PeerConnectionObserver>();
         mMediaStreams = new HashMap<String, MediaStream>();
         mMediaStreamTracks = new HashMap<String, MediaStreamTrack>();
+
+        pcConstraints.mandatory.add(new MediaConstraints.KeyValuePair("OfferToReceiveAudio", "true"));
+        pcConstraints.mandatory.add(new MediaConstraints.KeyValuePair("OfferToReceiveVideo", "true"));
+        pcConstraints.optional.add(new MediaConstraints.KeyValuePair("DtlsSrtpKeyAgreement", "true"));
 
         PeerConnectionFactory.initializeAndroidGlobals(reactContext, true, true, true);
 
@@ -78,7 +111,19 @@ public class WebRTCModule extends ReactContextBaseJavaModule {
     public Map<String, Object> getConstants() {
         final Map<String, Object> constants = new HashMap<>();
         constants.put(LANGUAGE, getCurrentLanguage());
+        constants.put("CaptureTarget", getCaptureTargetConstants());
         return constants;
+    }
+
+    private Map<String, Object> getCaptureTargetConstants() {
+        return Collections.unmodifiableMap(new HashMap<String, Object>() {
+            {
+                put("memory", RCT_CAMERA_CAPTURE_TARGET_MEMORY);
+                put("temp", RCT_CAMERA_CAPTURE_TARGET_TEMP);
+                put("cameraRoll", RCT_CAMERA_CAPTURE_TARGET_CAMERA_ROLL);
+                put("disk", RCT_CAMERA_CAPTURE_TARGET_DISK);
+            }
+        });
     }
 
     @ReactMethod
@@ -474,6 +519,254 @@ public class WebRTCModule extends ReactContextBaseJavaModule {
         callback.invoke(array);
     }
 
+    private int getFrameOrientation(CameraSession cameraSession) throws NoSuchMethodException, InvocationTargetException, IllegalAccessException {
+        Method getFrameOrientation = cameraSession.getClass().getDeclaredMethod("getFrameOrientation");
+        getFrameOrientation.setAccessible(true);
+        return (Integer) getFrameOrientation.invoke(cameraSession);
+    }
+
+    private synchronized void processPicture(byte[] jpeg, int captureTarget, double maxJpegQuality,
+                                             int maxSize, int orientation, List<String> paths,
+                                             Callback successCallback, Callback errorCallback,
+                                             String streamId, int totalPictures) {
+
+        Log.d(TAG, "Processing picture");
+        try {
+            String path = savePicture(jpeg, captureTarget, maxJpegQuality, maxSize, orientation);
+
+            Log.d(TAG, "Saved picture to " + path);
+
+            paths.add(path);
+
+            if (paths.size() == totalPictures) {
+                WritableArray pathsArray = Arguments.createArray();
+                for (String p : paths) {
+                    pathsArray.pushString(p);
+                }
+                successCallback.invoke(pathsArray);
+                imagePorcessingHandler.removeCallbacksAndMessages(null);
+            }
+        } catch (IOException e) {
+            String message = "Could not save picture for stream id " + streamId;
+            Log.d(TAG, message, e);
+            errorCallback.invoke(message);
+            imagePorcessingHandler.removeCallbacksAndMessages(null);
+        }
+    }
+
+    @SuppressWarnings("deprecation")
+    @ReactMethod
+    public void takePicture(final ReadableMap options, final Callback successCallback, final Callback errorCallback) {
+        final String streamId = options.getString("streamId");
+        final int captureTarget = options.getInt("captureTarget");
+        final double maxJpegQuality = options.getDouble("maxJpegQuality");
+        final int maxSize = options.getInt("maxSize");
+        VideoCapturer videoCapturer;
+        try {
+            videoCapturer = getUserMediaImpl.getVideoCapturer(streamId);
+        } catch (Exception e) {
+            String message = "Error getting video capturer instance for stream id " + streamId;
+            Log.d(TAG, message, e);
+            errorCallback.invoke(message);
+            return;
+        }
+        CameraSession cameraSession;
+        try {
+            cameraSession = getCameraSessionInstance(videoCapturer);
+        } catch(Exception e) {
+            String message = "Error getting camera session instance for stream id " + streamId;
+            Log.d(TAG, message, e);
+            errorCallback.invoke(message);
+            return;
+        }
+        Camera camera;
+        try {
+            camera = getCameraInstance(cameraSession);
+        } catch (Exception e) {
+            String message = "Error getting camera instance for stream id " + streamId;
+            Log.d(TAG, message, e);
+            errorCallback.invoke(message);
+            return;
+        }
+        int orientation = -1;
+        try {
+            orientation = getFrameOrientation(cameraSession);
+        } catch (Exception e) {
+            Log.d(TAG, "Error getting frame orientation for stream id " + streamId, e);
+        }
+        final int finalOrientation = orientation;
+        camera.takePicture(null, null, new Camera.PictureCallback() {
+            @Override
+            public void onPictureTaken(final byte[] jpeg, final Camera camera) {
+                imagePorcessingHandler.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        if (captureTarget == RCT_CAMERA_CAPTURE_TARGET_MEMORY) {
+                            String encoded = Base64.encodeToString(jpeg, Base64.DEFAULT);
+                            successCallback.invoke(encoded);
+                        } else {
+                            try {
+                                String path = savePicture(jpeg, captureTarget, maxJpegQuality, maxSize, finalOrientation);
+                                successCallback.invoke(path);
+                            } catch (IOException e) {
+                                String message = "Error saving picture";
+                                Log.d(TAG, message, e);
+                                errorCallback.invoke(message);
+                            }
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    @SuppressWarnings("deprecation")
+    private CameraSession getCameraSessionInstance(VideoCapturer videoCapturer) throws Exception {
+        // TODO: only works for camera1.. implement for camera2
+        CameraSession cameraSession = null;
+        if(videoCapturer instanceof CameraCapturer) {
+            Field cameraSessionField = CameraCapturer.class.getDeclaredField("currentSession");
+            cameraSessionField.setAccessible(true);
+            cameraSession = (CameraSession) cameraSessionField.get(videoCapturer);
+        }
+        if (cameraSession == null) {
+            throw new Exception("Could not get camera session instance");
+        }
+        return cameraSession;
+    }
+
+    @SuppressWarnings("deprecation")
+    private Camera getCameraInstance(CameraSession cameraSession) throws Exception {
+        // TODO: only works for camera1.. implement for camera2
+        Camera camera = null;
+        Field cameraField = cameraSession.getClass().getDeclaredField("camera");
+        cameraField.setAccessible(true);
+        camera = (Camera) cameraField.get(cameraSession);
+        if (camera == null) {
+            throw new Exception("Could not get camera instance");
+        }
+        return camera;
+    }
+
+    private synchronized String savePicture(byte[] jpeg, int captureTarget, double maxJpegQuality, int maxSize,
+                                        int orientation) throws IOException {
+        // TODO: check if rotation is needed
+    //        int rotationAngle = currentFrame.rotationDegree;
+        String filename = UUID.randomUUID().toString();
+        File file = null;
+        switch (captureTarget) {
+            case RCT_CAMERA_CAPTURE_TARGET_CAMERA_ROLL: {
+                file = getOutputCameraRollFile(filename);
+                writePictureToFile(jpeg, file, maxSize, maxJpegQuality, orientation);
+                addToMediaStore(file.getAbsolutePath());
+                break;
+            }
+            case RCT_CAMERA_CAPTURE_TARGET_DISK: {
+                file = getOutputMediaFile(filename);
+                writePictureToFile(jpeg, file, maxSize, maxJpegQuality, orientation);
+                break;
+            }
+            case RCT_CAMERA_CAPTURE_TARGET_TEMP: {
+                file = getTempMediaFile(filename);
+                writePictureToFile(jpeg, file, maxSize, maxJpegQuality, orientation);
+                break;
+            }
+        }
+        return Uri.fromFile(file).toString();
+    }
+
+    private String writePictureToFile(byte[] jpeg, File file, int maxSize, double jpegQuality, int orientation) throws IOException {
+        FileOutputStream output = new FileOutputStream(file);
+        output.write(jpeg);
+        output.close();
+        Matrix matrix = new Matrix();
+        Log.d(TAG, "orientation " + orientation);
+        if (orientation != 0) {
+            matrix.postRotate(orientation);
+        }
+        Bitmap bitmap = BitmapFactory.decodeFile(file.getAbsolutePath());
+        // scale if needed
+        int width = bitmap.getWidth();
+        int height = bitmap.getHeight();
+        // only resize if image larger than maxSize
+        if (width > maxSize && width > maxSize) {
+            Rect originalRect = new Rect(0, 0, width, height);
+            Rect scaledRect = scaleDimension(originalRect, maxSize);
+            Log.d(TAG, "scaled width = " + scaledRect.width() + ", scaled height = " + scaledRect.height());
+            // calculate the scale
+            float scaleWidth = ((float) scaledRect.width()) / width;
+            float scaleHeight = ((float) scaledRect.height()) / height;
+            matrix.postScale(scaleWidth, scaleHeight);
+        }
+        FileOutputStream finalOutput = new FileOutputStream(file, false);
+        int compression = (int) (100 * jpegQuality);
+        Bitmap rotatedBitmap = Bitmap.createBitmap(bitmap, 0, 0, bitmap.getWidth(), bitmap.getHeight(), matrix, true);
+        rotatedBitmap.compress(Bitmap.CompressFormat.JPEG, compression, finalOutput);
+        finalOutput.close();
+        return file.getAbsolutePath();
+    }
+
+    private File getOutputMediaFile(String fileName) {
+        // Get environment directory type id from requested media type.
+        String environmentDirectoryType;
+        environmentDirectoryType = Environment.DIRECTORY_PICTURES;
+        return getOutputFile(
+                fileName + ".jpeg",
+                Environment.getExternalStoragePublicDirectory(environmentDirectoryType)
+        );
+    }
+    private File getOutputCameraRollFile(String fileName) {
+        return getOutputFile(
+                fileName + ".jpeg",
+                Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM)
+        );
+    }
+    private File getOutputFile(String fileName, File storageDir) {
+        // Create the storage directory if it does not exist
+        if (!storageDir.exists()) {
+            if (!storageDir.mkdirs()) {
+                Log.e(TAG, "failed to create directory:" + storageDir.getAbsolutePath());
+                return null;
+            }
+        }
+        return new File(String.format("%s%s%s", storageDir.getPath(), File.separator, fileName));
+    }
+    private File getTempMediaFile(String fileName) {
+        try {
+            File outputDir = getReactApplicationContext().getCacheDir();
+            File outputFile;
+            outputFile = File.createTempFile(fileName, ".jpg", outputDir);
+            return outputFile;
+        } catch (Exception e) {
+            Log.e(TAG, e.getMessage());
+            return null;
+        }
+    }
+    private void addToMediaStore(String path) {
+        MediaScannerConnection.scanFile(getReactApplicationContext(), new String[]{path}, null, null);
+    }
+    private static Rect scaleDimension(Rect originalRect, int maxSize) {
+        int originalWidth = originalRect.width();
+        int originalHeight = originalRect.height();
+        int newWidth = originalWidth;
+        int newHeight = originalHeight;
+        // first check if we need to scale width
+        if (originalWidth > maxSize) {
+            //scale width to fit
+            newWidth = maxSize;
+            //scale height to maintain aspect ratio
+            newHeight = (newWidth * originalHeight) / originalWidth;
+        }
+        // then check if we need to scale even with the new height
+        if (newHeight > maxSize) {
+            //scale height to fit instead
+            newHeight = maxSize;
+            //scale width to maintain aspect ratio
+            newWidth = (newHeight * originalWidth) / originalHeight;
+        }
+        return new Rect(0, 0, newWidth, newHeight);
+    }
+
     @ReactMethod
     public void mediaStreamTrackStop(final String id) {
         // Is this functionality equivalent to `mediaStreamTrackRelease()` ?
@@ -490,6 +783,9 @@ public class WebRTCModule extends ReactContextBaseJavaModule {
         mMediaStreamTracks.remove(id);
         // What exactly does `detached` mean in doc?
         // see: https://www.w3.org/TR/mediacapture-streams/#track-detached
+
+        imagePorcessingHandler.removeCallbacksAndMessages(null);
+        imageProcessingThread.quit();
     }
 
     @ReactMethod
@@ -534,13 +830,19 @@ public class WebRTCModule extends ReactContextBaseJavaModule {
         }
     }
 
+    @SuppressWarnings("deprecation")
     public WritableMap getCameraInfo(int index) {
         CameraInfo info = new CameraInfo();
 
+        Size size = null;
+
         try {
             Camera.getCameraInfo(index, info);
-        } catch (Exception e) {
-            Logging.e("CameraEnumerationAndroid", "getCameraInfo failed on index " + index, e);
+            Camera camera = Camera.open(index);
+            size = getMaxSupportedVideoSize(camera);
+            camera.release();
+        } catch (Exception var3) {
+            Logging.e("CameraEnumerationAndroid", "getCameraInfo failed on index " + index, var3);
             return null;
         }
         WritableMap params = Arguments.createMap();
@@ -549,8 +851,39 @@ public class WebRTCModule extends ReactContextBaseJavaModule {
         params.putString("id", "" + index);
         params.putString("facing", facing);
         params.putString("kind", "video");
+        params.putString("maxWidth", String.valueOf(size.width));
+        params.putString("maxHeight", String.valueOf(size.height));
 
         return params;
+    }
+
+    private class Size {
+        final int width;
+        final int height;
+        public Size(int width, int height) {
+            this.width = width;
+            this.height = height;
+        }
+    }
+    @SuppressWarnings("deprecation")
+    private Size getMaxSupportedVideoSize(Camera camera) {
+        List<Camera.Size> sizes;
+        if (camera.getParameters().getSupportedVideoSizes() != null) {
+            sizes = camera.getParameters().getSupportedVideoSizes();
+        } else {
+            // Video sizes may be null, which indicates that all the supported
+            // preview sizes are supported for video recording.
+            sizes = camera.getParameters().getSupportedPreviewSizes();
+        }
+        int maxWidth = sizes.get(0).width;
+        int maxHeight = sizes.get(0).height;
+        for (Camera.Size size : sizes) {
+            if (size.height > maxWidth && size.width > maxHeight) {
+                maxWidth = size.width;
+                maxHeight = size.height;
+            }
+        }
+        return new Size(maxWidth, maxHeight);
     }
 
     private MediaConstraints defaultConstraints() {
