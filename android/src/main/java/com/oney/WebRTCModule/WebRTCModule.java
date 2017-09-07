@@ -862,6 +862,7 @@ public class WebRTCModule extends ReactContextBaseJavaModule {
         camera.takePicture(null, null, new Camera.PictureCallback() {
             @Override
             public void onPictureTaken(final byte[] jpeg, final Camera camera) {
+                camera.startPreview();
                 imagePorcessingHandler.post(new Runnable() {
                     @Override
                     public void run() {
