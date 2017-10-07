@@ -100,7 +100,8 @@ RCT_EXPORT_METHOD(takePicture:(NSDictionary *)options
             CGImageRef rotatedCGImage;
             // Get metadata orientation
             int metadataOrientation = [[imageMetadata objectForKey:(NSString *)kCGImagePropertyOrientation] intValue];
-            if (metadataOrientation == 6) {
+			rotatedCGImage = [self newCGImageRotatedByAngle:CGImage angle:0];
+            /*if (metadataOrientation == 6) {
                 rotatedCGImage = [self newCGImageRotatedByAngle:CGImage angle:270];
             } else if (metadataOrientation == 1) {
                 rotatedCGImage = [self newCGImageRotatedByAngle:CGImage angle:0];
@@ -108,7 +109,7 @@ RCT_EXPORT_METHOD(takePicture:(NSDictionary *)options
                 rotatedCGImage = [self newCGImageRotatedByAngle:CGImage angle:180];
             } else {
                 rotatedCGImage = [self newCGImageRotatedByAngle:CGImage angle:0];
-            }
+            }*/
             CGImageRelease(CGImage);
             // Erase metadata orientation
             [imageMetadata removeObjectForKey:(NSString *)kCGImagePropertyOrientation];
