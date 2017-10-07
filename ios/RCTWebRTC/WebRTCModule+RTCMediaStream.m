@@ -99,8 +99,13 @@ RCT_EXPORT_METHOD(takePicture:(NSDictionary *)options
             // Rotate it
             CGImageRef rotatedCGImage;
             // Get metadata orientation
-            int metadataOrientation = [[imageMetadata objectForKey:(NSString *)kCGImagePropertyOrientation] intValue];
-			rotatedCGImage = [self newCGImageRotatedByAngle:CGImage angle:0];
+            // int metadataOrientation = [[imageMetadata objectForKey:(NSString *)kCGImagePropertyOrientation] intValue];
+	    // boyangdu: Fix the snapshot orientation for Ubiatar to landscape 
+	    if ([[UIDevice currentDevice] orientation] == UIInterfaceOrientationLandscapeLeft) {
+                rotatedCGImage = [self newCGImageRotatedByAngle:CGImage angle:180];
+            } else {// if ([[UIDevice currentDevice] orientation] == UIInterfaceOrientationLandscapeRight) {
+                rotatedCGImage = [self newCGImageRotatedByAngle:CGImage angle:0];
+            }
             /*if (metadataOrientation == 6) {
                 rotatedCGImage = [self newCGImageRotatedByAngle:CGImage angle:270];
             } else if (metadataOrientation == 1) {
